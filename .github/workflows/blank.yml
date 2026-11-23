@@ -1,6 +1,6 @@
-# Put this file in your GitHub repo at:  .github/workflows/build-apk.yml
-# Then upload your project zip into the repo folder  upload/  (commit it).
-# The workflow unzips it, builds the APK with Gradle and attaches it as a download.
+# Repo me save karo: .github/workflows/build-apk.yml
+# Phir project zip ko repo me (best: upload/ folder me) commit/upload karo.
+# Build apne aap chalega, APK "Artifacts" me download hoga.
 name: Build APK from uploaded zip
 
 on:
@@ -13,7 +13,8 @@ on:
         default: release
   push:
     paths:
-      - "upload/*.zip"
+      - "**.zip"
+      - "**.ZIP"
 
 permissions:
   contents: read
@@ -23,37 +24,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Check out repo (to get the uploaded zip)
+      - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Find the newest zip in upload/
+      - name: Find the newest zip
         id: zip
         run: |
           set -euo pipefail
-          ZIP=$(ls -t upload/*.zip 2>/dev/null | head -n1 || true)
-          if [ -z "$ZIP" ]; then
-            echo "No zip found in upload/. Commit your project zip there and run again."
+          BEST=""; BEST_T=0
+          while IFS= read -r f; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            [ -z "$t" ] && t=0
+            if [ -z "$BEST" ] || [ "$t" -ge "$BEST_T" ]; then BEST="$f"; BEST_T="$t"; fi
+          done < <(find . -type f \( -iname '*.zip' \) -not -path './.git/*' -not -path './.github/*' | sed 's|^\./||' | sort)
+          if [ -z "$BEST" ]; then
+            echo "::error::Repo me koi .zip nahi mila. Project zip ko upload/ folder me commit karo (Add file > Upload files) aur dobara run karo."
+            echo "Repo files:"; git ls-files | head -50
             exit 1
           fi
-          echo "Using: $ZIP"
-          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "Using: $BEST"
+          echo "path=$BEST" >> "$GITHUB_OUTPUT"
 
       - name: Unzip and locate the Gradle project
         run: |
           set -euo pipefail
-          rm -rf src_unzipped
-          mkdir src_unzipped
+          rm -rf src_unzipped && mkdir src_unzipped
           unzip -q "${{ steps.zip.outputs.path }}" -d src_unzipped
-          SETTINGS=$(find src_unzipped -name settings.gradle | head -n1 || true)
+          SETTINGS=$(find src_unzipped \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2- || true)
           if [ -z "$SETTINGS" ]; then
-            echo "settings.gradle not found inside the zip."
+            echo "::error::Zip ke andar settings.gradle / settings.gradle.kts nahi mila."
             exit 1
           fi
           PROJECT_DIR=$(dirname "$SETTINGS")
           echo "Gradle project: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          if [ -f "$PROJECT_DIR/gradlew" ]; then echo "HAS_WRAPPER=1" >> "$GITHUB_ENV"; else echo "HAS_WRAPPER=0" >> "$GITHUB_ENV"; fi
 
-      - name: Set up JDK 17 (needed by Android Gradle Plugin 8.2)
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -62,28 +71,54 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install platform, build tools and NDK 22.0.7026061
+      - name: Install platform, build tools and NDK
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-30" "build-tools;34.0.0" "ndk;22.0.7026061"
+          sdkmanager "platforms;android-30" "platforms;android-34" "build-tools;34.0.0" "ndk;22.0.7026061" || true
+
+      - name: Set up Gradle (only if project has no gradlew)
+        if: env.HAS_WRAPPER == '0'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
       - name: Build
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
-          chmod +x gradlew
           VARIANT="${{ github.event.inputs.variant }}"
+          [ -z "$VARIANT" ] && VARIANT=release
           if [ "$VARIANT" = "debug" ]; then TASK=assembleDebug; else TASK=assembleRelease; fi
-          ./gradlew --no-daemon "$TASK"
+          if [ "$HAS_WRAPPER" = "1" ]; then
+            chmod +x gradlew
+            ./gradlew --no-daemon "$TASK"
+          else
+            gradle --no-daemon "$TASK"
+          fi
 
-      - name: Collect the APK
+      - name: Collect and sign the APK
         run: |
           set -euo pipefail
-          mkdir -p out
-          find "$PROJECT_DIR" -path '*outputs/apk*' -name '*.apk' -exec cp {} out/ \;
+          mkdir -p out raw
+          find "$PROJECT_DIR" -path '*outputs/apk*' -name '*.apk' -exec cp {} raw/ \;
+          ls -la raw
+          test -n "$(ls -A raw)"
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          keytool -genkeypair -keystore ci.jks -alias ci -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass android -keypass android -dname "CN=CI Build" >/dev/null 2>&1
+          for apk in raw/*.apk; do
+            name=$(basename "$apk")
+            if echo "$name" | grep -qi unsigned; then
+              out="out/${name/-unsigned/}"
+              "$BT/zipalign" -f -p 4 "$apk" aligned.apk
+              "$BT/apksigner" sign --ks ci.jks --ks-pass pass:android --key-pass pass:android \
+                --out "$out" aligned.apk
+            else
+              cp "$apk" "out/$name"
+            fi
+          done
           ls -la out
-          test -n "$(ls -A out)"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
