@@ -1,0 +1,94 @@
+# Put this file in your GitHub repo at:  .github/workflows/build-apk.yml
+# Then upload your project zip into the repo folder  upload/  (commit it).
+# The workflow unzips it, builds the APK with Gradle and attaches it as a download.
+name: Build APK from uploaded zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build variant"
+        type: choice
+        options: [release, debug]
+        default: release
+  push:
+    paths:
+      - "upload/*.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo (to get the uploaded zip)
+        uses: actions/checkout@v4
+
+      - name: Find the newest zip in upload/
+        id: zip
+        run: |
+          set -euo pipefail
+          ZIP=$(ls -t upload/*.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "No zip found in upload/. Commit your project zip there and run again."
+            exit 1
+          fi
+          echo "Using: $ZIP"
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip and locate the Gradle project
+        run: |
+          set -euo pipefail
+          rm -rf src_unzipped
+          mkdir src_unzipped
+          unzip -q "${{ steps.zip.outputs.path }}" -d src_unzipped
+          SETTINGS=$(find src_unzipped -name settings.gradle | head -n1 || true)
+          if [ -z "$SETTINGS" ]; then
+            echo "settings.gradle not found inside the zip."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "Gradle project: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17 (needed by Android Gradle Plugin 8.2)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform, build tools and NDK 22.0.7026061
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-30" "build-tools;34.0.0" "ndk;22.0.7026061"
+
+      - name: Build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          VARIANT="${{ github.event.inputs.variant }}"
+          if [ "$VARIANT" = "debug" ]; then TASK=assembleDebug; else TASK=assembleRelease; fi
+          ./gradlew --no-daemon "$TASK"
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find "$PROJECT_DIR" -path '*outputs/apk*' -name '*.apk' -exec cp {} out/ \;
+          ls -la out
+          test -n "$(ls -A out)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: out/*.apk
+          if-no-files-found: error
+          
